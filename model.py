@@ -1,6 +1,6 @@
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 from tensorflow.keras.layers import Layer
 from tensorflow.keras.layers import Conv2D, ReLU, LeakyReLU, Dense, Dropout, Lambda, Concatenate, AvgPool2D, MaxPool2D, \
@@ -14,6 +14,14 @@ import torch
 import scipy.io as scio
 
 tf.config.experimental_run_functions_eagerly(True)
+
+
+def shuffle(len, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    indices = np.arange(0, len)
+    np.random.shuffle(indices)
+    return indices
 
 
 class Conttextual_loss(Layer):
@@ -110,16 +118,18 @@ class Featureloss(Layer):
         nb_og = self.out_filter // self.groups  # 对输出特征图通道进行分组
         self.conv_list_x = [
             tf.keras.Sequential(
-                [tf.keras.layers.Conv2D(filters=nb_og, kernel_size=(3,3), strides=(1,1),
-                                        padding='same', use_bias=False) for i in range(self.conv_len)]+[tf.keras.layers.Conv2D(filters=nb_og, kernel_size=self.kernel_size, strides=self.strides,
-                                        padding=self.padding_choose, use_bias=False)])
+                [tf.keras.layers.Conv2D(filters=nb_og, kernel_size=(3, 3), strides=(1, 1),
+                                        padding='same', use_bias=False) for i in range(self.conv_len)] + [
+                    tf.keras.layers.Conv2D(filters=nb_og, kernel_size=self.kernel_size, strides=self.strides,
+                                           padding=self.padding_choose, use_bias=False)])
             for _ in range(self.groups)
         ]
         self.conv_list_y = [
             tf.keras.Sequential(
-                [tf.keras.layers.Conv2D(filters=nb_og, kernel_size=(3,3), strides=(1,1),
-                                        padding='same', use_bias=False) for i in range(self.conv_len)]+[tf.keras.layers.Conv2D(filters=nb_og, kernel_size=self.kernel_size, strides=self.strides,
-                                        padding=self.padding_choose, use_bias=False)])
+                [tf.keras.layers.Conv2D(filters=nb_og, kernel_size=(3, 3), strides=(1, 1),
+                                        padding='same', use_bias=False) for i in range(self.conv_len)] + [
+                    tf.keras.layers.Conv2D(filters=nb_og, kernel_size=self.kernel_size, strides=self.strides,
+                                           padding=self.padding_choose, use_bias=False)])
             for _ in range(self.groups)
         ]
         self.conv_x = lambda x: self.group_conv(x, nb_ig=nb_ig, nb_og=nb_og, groups=self.groups, feature='x')
@@ -131,6 +141,11 @@ class Featureloss(Layer):
         self.sotfmax = Softmax(axis=-1)
         self.contextualloss1 = Conttextual_loss()
         self.contextualloss2 = Conttextual_loss()
+        self.classifiar = tf.keras.Sequential([
+            tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(2),
+
+        ])
         super(Featureloss, self).build(input_shape)
 
     def call(self, input, training=None, **kwargs):
@@ -143,7 +158,13 @@ class Featureloss(Layer):
         feature_x = self.conv_x(feature_x)
         feature_y = self.conv_y(feature_y)
         loss_conv = self.contextualloss2((feature_x, feature_y))
-        return loss_conv
+        out_x = tf.keras.layers.Softmax(axis=-1)(self.classifiar(feature_x))
+        out_y = tf.keras.layers.Softmax(axis=-1)(self.classifiar(feature_y))
+        loss_class=tf.reduce_sum(tf.abs(out_x-out_y),axis=-1)
+        out_x = tf.argmax(out_x, axis=1)
+        out_y = tf.argmax(out_y, axis=1)
+        pred = tf.cast(tf.equal(out_x, out_y),dtype=tf.float32)
+        return loss_conv+loss_class, pred
 
 
 def Calculate(feature_size_x, feature_size_y, feature_depth, out_filter, batchsize=64, padding_choose='same',
@@ -157,36 +178,41 @@ def Calculate(feature_size_x, feature_size_y, feature_depth, out_filter, batchsi
 
 
 model = Calculate(32, 32, 5, 5, batchsize=64, use_conv='true')
-
 data = np.load('new_input.npy')
 label = np.load('new_label.npy')
-x_train = data[:1024, ...]
-y_train = label[:1024, ...]
-x_test = data[1024:, ...]
-y_test = label[1024:, ...]
-train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(1000).batch(64)
-test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(64)
+indices = shuffle(data.shape[0])
+print(indices)
+data = data[indices, ...]
+label = label[indices, ...]
+x_train = data[::2, ...]
+y_train = label[::2, ...]
+x_test = data[1::2, ...]
+y_test = label[1::2, ...]
+train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train)).shuffle(1000).batch(64, drop_remainder=True)
+test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(64, drop_remainder=True)
 from loss import LossFunction
 
 Loss = LossFunction(learning_rate=10.)
 optimizer = tf.keras.optimizers.Adam(learning_rate=0.1)
+Loss_2 = tf.keras.losses.BinaryCrossentropy()
 
 
 @tf.function
 def train_step(image, labels):
     with tf.GradientTape() as tape:
-        output = model(image)
-        loss = Loss(labels, output)
+        output, pred = model(image)
+        loss_return = Loss(labels, output)
+        loss = tf.reduce_mean(loss_return)
         grad_list = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grad_list, model.trainable_variables))
-        return loss
+        return loss_return, pred
 
 
 @tf.function
 def test_step(image, labels):
-    output = model(image)
-    loss = Loss(labels, output)
-    return loss
+    output, pred = model(image)
+    loss_return = Loss(labels, output)
+    return loss_return, pred
 
 
 epochs = 80
@@ -194,19 +220,28 @@ from tensorflow.keras.metrics import MeanAbsoluteError
 
 train_metric = MeanAbsoluteError()
 test_metric = MeanAbsoluteError()
-
+train_acc = MeanAbsoluteError()
+test_acc = MeanAbsoluteError()
 for i in range(epochs):
     train_metric.reset_states()
     test_metric.reset_states()
+    train_acc.reset_states()
+    test_acc.reset_states()
     for images, labels in train_ds:
         images = [tf.cast(tf.squeeze(_), dtype=tf.float32) for _ in tf.split(images, axis=1, num_or_size_splits=[1, 1])]
         labels = tf.cast(labels, dtype=tf.float32)
-        loss_1 = train_step(images, labels)
+        loss_1, pred_1 = train_step(images, labels)
         train_metric.update_state(loss_1, 0)
-    print("the epoch {}'s train loss is {:.3f}".format(i, train_metric.result().numpy().item()))
+        pred_1 = tf.cast(tf.equal(pred_1, labels), dtype=tf.float32)
+        train_acc.update_state(tf.multiply(pred_1, tf.constant(100., dtype=tf.float32)), 0)
+    print("the epoch {}'s train loss is {:.3f},acc is {:.3f}".format(i, train_metric.result().numpy().item(),
+                                                                     train_acc.result().numpy().item()))
     for images, labels in test_ds:
         images = [tf.cast(tf.squeeze(_), dtype=tf.float32) for _ in tf.split(images, axis=1, num_or_size_splits=[1, 1])]
         labels = tf.cast(labels, dtype=tf.float32)
-        loss_2 = test_step(images, labels)
+        loss_2, pred_2 = test_step(images, labels)
         test_metric.update_state(loss_2, 0)
-    print("the epoch {}'s test loss is {:.3f}".format(i, test_metric.result().numpy().item()))
+        pred_2 = tf.cast(tf.equal(pred_2, labels), dtype=tf.float32)
+        test_acc.update_state(tf.multiply(pred_2, tf.constant(100., dtype=tf.float32)), 0)
+    print("the epoch {}'s test loss is {:.3f},acc is {:.3f}".format(i, test_metric.result().numpy().item(),
+                                                                    test_acc.result().numpy().item()))
